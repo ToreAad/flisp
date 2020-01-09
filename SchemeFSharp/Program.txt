@@ -1,0 +1,340 @@
+﻿// Learn more about F# at http://fsharp.org
+
+open System
+
+[<EntryPoint>]
+let main argv =
+    match Array.toList with
+    | [] -> runRepl ()
+    | filename::args -> runOne filename args
+    0
+
+let runOne (filename: string) (args : list<string>) =
+    let env = primitiveBindings () 
+        |> loadStdLib
+        |> bindVars ["args", List (List.map String args)]
+    List [Atom "load"; String filename] 
+        |> eval env
+        |> showVal
+        |> printStr
+
+let runRepl () =
+    let env = primitiveBindings () |> loadStdLib
+    until (fun s -> s = "Quit" || s = "quit") (fun () -> readPrompt "Lisp>>> ") (evalAndPrint env)
+
+
+let printStr (s: string) = Console.Write(s)
+let readPrompt(s: string) = printStr s; Console.ReadLine ()
+
+let newLine () = Console.WriteLine ()
+
+let evalAndPrint env = evalString env >> showVal >> printStr >> newLine
+
+let evalString env expr =
+    try
+        expr |> readExpr |> eval env
+    with
+    | LispException (error) -> String (showError error)
+
+let rec until pred propmpter evaluator =
+    let result = prompter ()
+    if not (pred result) then
+        evaluator result
+        until pred propmpter evaluator
+
+let loadStdLib env =
+    eval env (List [Atom "Load"; String "stdlib.scm"]) |> ignore
+    env
+
+let primitiveBindings () =
+    (nullEnv ()) |> bindVars [for v, f in primitives -> v, PrimitiveFunc f]
+
+type Env = (string * LispVal ref) list ref
+and FuncRecord = {
+    parms: string list;
+    varargs: string option;
+    body: LispVal list;
+    closure: Env}
+and LispVal =
+    | Atom of string
+    | List of LispVal list
+    | DottedList of LispVal list * LispVal
+    | Number of int
+    | String of string
+    | Bool of bool
+    | PrimitiveFun of (LispVal list -> LispVal)
+    | Func of FuncRecord
+    | Port of System.IO.FileStream
+
+
+eval env = function
+    | String _ as v -> v
+    | Number _ as v -> v
+    | Bool _ as v -> v
+    | Atom var -> getVar var Env
+    | List [Atom "quote"; v] -> v
+    | List [Atom "if"; pred; conseq; alt] -> evalIf env pred conseq alt
+    | List [Atom "load"; filename] -> load [fileName] |> List.map (eval env) |> last
+    | List [Atom "set!"; Atom var; form] -> env |> setVar var (eval env form)
+	| List [Atom "define"; Atom var; form] -> define env var (eval env form)
+	| List (Atom "define"::(List(Atom var::parms)::body)) ->
+		makeNormalFunc env parms body |> define env var
+	| List (Atom "define"::(DottedList((Atom var::parms), varargs)::body)) ->
+		makeVarargs varargs env parms body |> define env var
+	| List (Atom "lambda"::(List parms::body)) -> makeNormalFunc env parms body
+	| List (Atom "lambda"::(DottedList(parms, varargs)::body)) -> makeVarargs varargs env parms body
+	| List (Atom "lambda" ::((Atom _) as varargs ::body)) -> makeVarargs varargs env [] body
+	| List (func::args) ->
+		let f = eval env func
+		let argVas = List.map (eval env) args
+		apply f argVals
+	| badForm -> throw (BadSpecialForm("Unrecognized special form", badForm))
+
+
+evalIf env pred conseq alt =
+	match eval env pred with
+		| Bool(false) -> evan env alt
+		| _ -> eval env conseq
+
+let load = fileIOFunction (fun fileName -> File.ReadAllText(fileName)
+			|> readExprList)
+
+let fileIOFunction func = function
+	| [String fileName] -> fun (fileName)
+	| [] -> throw (IOError("No file name"))
+	| args -> throw (NumArgs(1, args))
+
+let makeFunc varargs env parms body =
+	Func ({
+		parms = (List.map showVal parms); 
+		varargs = varargs;
+		body = body;
+		closure = env})
+
+let makeNormalFunc = makeFunc None
+let makeVarargs = showVal >> Some >> makeFunc
+
+and apply func args =
+	match func with
+	| PrimitiveFunc(f) -> f args
+	| Funct {parms=parms;varargs=varargs;body=body;closure=closure}) ->
+		let invalidNonVarargs = args.Length <> parms.Length && varargs.IsNone
+		let invalidVarargs = args.Length <>parms.Length && varargs.IsSome
+		if invalidNonVarargs || invalidVarargs then
+			throw (NumArgs(parms.Length, args))
+		else
+			let remainingArgs = args |> Seq.skip parms.Length |> Seq.toList
+			let evalBody env = body |> List.map (eval env) |> last
+			let rec zip xs1 xs2 acc = 
+				match xs1, xs2 with
+				| x1::xs1, x2::xs2 -> zip xs1 xs2 ((x1,x2)::axx)
+				| _ -> acc
+			let bindVarArgs arg env =
+				match arg with
+				| Some (argName) -> bindVars [argName, (List remainingArgs)] env
+				| None -> env
+			bindVars (zip parms args []) closure
+				|> bindVarArgs
+				|> evalBody
+	| funcName -> throw (NotFunction("Expecting a function, getting ", showVal funcName))
+		
+		
+let rec primitives = 
+	[ 
+		"+", numericBinop (+)
+		"-", numericBinop (-)
+		"*", numericBinop (*)  --*)
+		"/", numericBinop (/)
+		"mod", numericBinop (%)
+		"=", numBoolBinop (=)
+		"<", numBoolBinop (<)
+		">", numBoolBinop (>)
+		"/=", numBoolBinop (/=)
+		">=", numBoolBinop (>=)
+		"&&", boolBoolBinop (&&)
+		"||", boolBoolBinop (||)
+		"string=?", strBoolBinop (=)
+		"string>?", strBoolBinop (>)
+		"string>?", strBoolBinop (<)
+		"string<=?", strBoolBinop (<=)
+		"string>=?", strBoolBinop (>=)
+		"car", car
+		"cdr", cdr
+		"cons", cons
+		"eq?", eqv
+		"eqv?", eqv
+		"equal?", equal
+		"apply", applyProc
+		"open-input-file", makePort FileAccess.Read
+		"open-output-file", makePort FileAccess.Write
+		"close-input-port", closePort
+		"close-output-port", closePort
+		"read", readProc
+		"write", writeProc
+		"read-contents", readContents
+		"read-all", readAll
+	]
+	
+let numericBinop op parms = 
+	if List.length parms < 2
+	then throw <| NumArgs(2, parms)
+	else parms |> List.map unpackNum |> foldl1 op |> number
+
+let foldl1 op = function
+	| h::t -> List.fold op h
+	| [] -> throw (Default("Expected a not empty list, got an empty list"))
+	
+let boolBinop unpacker op args = 
+	match args with
+	| [left; right] -> Bool (op (unpacker left) (unpacker right))
+	| _ -> throw (NumArgs (2, args))
+let numBoolBinop = boolBinop unpackNum
+let strBoolBinop = boolBinop unpackStr
+let boolBoolBinop = boolBinop unpackBool
+
+let car = function
+	| [List (x::_)] -> x
+	| [DottedList (x::_, _)] -> x
+	| [badArg)] -> throw (TypeMismatch("pair", badArg))
+	| barArgList -> throw (NumArgs(1, badArgList))
+	
+let cdr = function
+	| [List (x::xs)] -> List xs
+	| [DottedList ([xs], x)] -> x1
+	| [DottedList ((_::xs), x)] -> DottedList (xs, x)
+	| [badArg] -> throw (TypeMismatch("pair", badArg))
+	| barArgList -> throw (Numargs (1, badArgList))
+	
+let cons = function
+	| [x; List xs] -> List (x::xs)
+	| [x; DottedList (xs, xlast)] -> DottedList (x::xs, xlast)
+	| [x1; x2] -> DottedList ([x1], x2)
+	| badArgList -> throw (NumArgs(2, badArgList))
+
+let rec eqvPrim e1 e2 = 
+	match e1, e2 with
+	| (Bool b1, Bool b2) -> b1 = b2
+	| (Number n1, Number n2) -> n1 = n2
+	| (String s1, String s2) -> s1 = s2
+	| (Atom a1, Atom a2) -> a1 = a2
+	| (DottedList (xs, x), DottedList(ys, y)) -> 
+		eqvPrim (List(xs @[x])) (List (ys @ [y]))
+	| (List l1, List l2) -> l1.Length = l2.Length && List.forall2 eqvPrim l1 l2
+	| _ -> false
+	
+let eqv = function
+	| [e1; e2] -> Bool (eqvPrim e1 e2)
+	| badArgList -> throw (NumArgs ( 2, badArgList))
+	
+let equal = function
+	| [arg1; arg2] ->
+		let unpackEqual = numUnpackEq arg1 arg2 ||
+						  strUnpackEq arg1 arg2 ||
+						  boolUnpackEq arg1 arg2
+	    Bool (eqvPrim arg1 arg2 || unpackEqual)
+	| argsList -> throw (NumArgs(2, argsList))
+	
+let tryUnpacker (unpack: Lispval -> 'a) (op: 'a -> 'a -> bool) arg1 arg2 =
+	try op (unpack arg1) (unpack arg2) with _ -> false
+
+let numUnpackEq = tryUnpacker unpackNum (=)
+let strUnpackEq = tryUnpacker unpackStr (=)
+let boolUnpackEq = tryUnpacker unpackBool (=)
+
+let applyProc = function
+	| [func; List args] -> apply func args
+	| func::args -> apply func args
+	| [] -> throw (Default("Expecting a function, got an empty list"))
+	
+let makePort fileAccess = fileIOFunction ( funt fileName ->
+	File.Open(filename, FileMode.OpenOrCreate, fileAccess) |> Port)
+	
+let closePort = function
+	| [Port(port)] -> port.Close(); Bool true
+	| _ -> Bool false
+	
+let rec readProc port =
+	let parseReader (reader: TextReader) = reader.ReadLine()
+		|> readExpr
+	match port with
+		| [] -> parseReader(System.Console.In)
+		| [Port(port)] ->
+			use reader = new StreamReader(port)
+			parseReader (reader)
+		| args -> throw (NumArgs(1, args))
+let writeProc objPort =
+	let write obj (writer: TextWriter) = writer.Write(showVal obj); Bool true
+	match objPort with
+	| [obj] -> write obj (System.Console.Out)
+	| [obj; Port(port)] ->
+		use writer = new StreamWriter(port)
+		write obj writer
+	| args -> throw (NumArgs (1, args))
+
+	
+let parseExpr, parseExprReg: ListParser * LispParser ref = createParserForwardedToRef()
+
+type ListParser = Parser<LispVal, unit>
+
+do parseExprRef := parseAtom
+	<|> parseString
+	<|> parseNumber
+	<|> parseQuoted
+	<|> parse {
+		do! chr '('
+		let! x = (attempt parseList) <|> parseDottedList
+		do! chr ')'
+		return x
+		}
+		
+let parseAtom : LispParser = parse{
+	let! first = letter <|> symbol
+	let! ret = manyChars (letter <|> symbol <|> digit)
+	return match first.ToString() + rest with
+		| "#t" -> Bool true
+		| "#f" -> Bool false
+		| atom -> Atom atom
+}
+
+let parseString : LispParser = parse{
+	do! chr '"'
+	let! xs = manyChars (noneOf "\"")
+	do! chr '"'
+	return String(xs)
+}
+
+let parseNumber : LispParser = 
+	many1Chars digit |>> (System.Int32.Parse >> Number)
+	
+let parseQuoted : LispParser =
+	chr '\'' >> parseExpr |>> fun expr -> List [Atom "quote"; expr]
+	
+let parseList : LispParser = sepBy parseExpr spaces1 |>> List
+
+let parseDottedList : LispParser = parse {
+	let! head = endby parseExpr spaces1
+	let! tail = chr '.' >>. spaces1 >>. parseExpr
+	return DottedList (head, tail)
+}
+
+let spaces1: LispParser<unit> = skipMany1 whitespace
+let chr c = skipChar c
+let endBy p sep = many (p .>> sep)
+let symbol : LispParser<char> = anyOf "!$%&|*+-/:<=>?@^_~#"
+
+let rec showVal = function
+	| String contents -> "\"" + contents "\""
+	| Atom name -> name
+	| Number num -> num.ToString()
+	| Bool t -> if t then "#t" else "#f"
+	| List l -> "(" + unwordsList l + ")"
+	| DottedList (head, tail) -> "(" + unwordsList head + "." + showVal tail + ")"
+	| PrimitiveFunc(_) -> "<primitive>"
+	| Port (_) -> "<IO port>"
+	| Func({params=params; varargs=varargs;body=body; closure=closure})->
+		"(lambda ("+unwordsList(parms|>List.map(String))
+			(match varargs with
+				| None -> ""
+				| Some(arg) _> " . " + arg ) + ")" ...)"
+and
+	unwordsList = List.map showVal >> String.concat " "
